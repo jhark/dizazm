@@ -1,0 +1,24 @@
+.{
+    .name = .dizazm,
+    .version = "0.0.0",
+    .fingerprint = 0x1dc194a53b30dc3a,
+    .minimum_zig_version = "0.14.0",
+
+    .dependencies = .{
+        .flags = .{
+            .url = "git+https://github.com/joegm/flags#0e2491d8e6d2be38dc0c2ce8e103469886e468bb",
+            .hash = "flags-0.10.0-a_9h3kR2AABNAfaPGRyOOGmWsfv12Hk6JQPTX4MM446s",
+        },
+        .capstone = .{
+            .url = "git+https://github.com/allyourcodebase/capstone#6035a194bea8472c463345b86c3ef9333490ecfe",
+            .hash = "capstone-5.0.1-tmNUgTRHAAC1nFVy0colCWwUSRm05SWdD-4kU5MK4ZpH",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
