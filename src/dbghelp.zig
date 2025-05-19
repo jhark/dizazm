@@ -109,7 +109,7 @@ pub fn deinit() void {
 pub fn findSymbolInfo(
     image_path: []const u8,
     symbol_name: []const u8,
-) !SymbolLocation {
+) !?SymbolLocation {
     var buf: [16384]u8 = undefined;
     var stack_allocator = std.heap.FixedBufferAllocator.init(&buf);
     const allocator = stack_allocator.allocator();
@@ -126,7 +126,7 @@ pub fn findSymbolInfo(
 pub fn findSymbolInfoW(
     image_path: [:0]const u16,
     symbol_name: [:0]const u16,
-) !SymbolLocation {
+) !?SymbolLocation {
     const mod_base = g_symLoadModuleExW(
         g_handle,
         null,
@@ -147,7 +147,12 @@ pub fn findSymbolInfoW(
     symbol_info.SizeOfStruct = @sizeOf(SYMBOL_INFOW);
 
     if (g_symFromNameW(g_handle, symbol_name, &symbol_info) == FALSE) {
-        std.log.err("SymFromNameW: {}\n", .{windows.GetLastError()});
+        const err = windows.GetLastError();
+        std.log.warn("SymFromNameW: {}\n", .{err});
+        if (err == windows.Win32Error.MOD_NOT_FOUND) {
+            // TODO -- This seems like a misleading error code being unable to find the symbol.
+            return null;
+        }
         return error.SymFromNameFailed;
     }
 

@@ -4,6 +4,8 @@ const cs = @import("capstone.zig");
 const dbghelp = @import("dbghelp.zig");
 const Image = @import("Image.zig");
 
+var g_use_dbghelp = true;
+
 // Command line options
 const Flags = struct {
     pub const description =
@@ -85,26 +87,20 @@ pub fn main() !void {
     var image = try Image.init(allocator, image_path);
     defer image.deinit();
 
+    dbghelp.init() catch |err| {
+        std.log.warn("dbghelp.dll is unavailable ({s}), using export table only", .{@errorName(err)});
+        g_use_dbghelp = false;
+    };
+    defer if (g_use_dbghelp) dbghelp.deinit();
+
     if (flags_.symbol) |symbol_name| {
         const stdout = std.io.getStdOut().writer();
 
-        dbghelp.init() catch |err| {
-            std.log.warn("dbghelp.dll is unavailable ({s}), using export table only", .{@errorName(err)});
-
-            const export_symbol = image.findExportSymbol(symbol_name, disassembly_length) catch |export_err| {
-                std.log.warn("Failed to find export symbol: {s}", .{@errorName(export_err)});
-                std.process.exit(1);
-            };
-
-            std.log.warn("Symbol size is unknown, using {d}", .{disassembly_length});
-
-            try stdout.print("{s}:\n", .{symbol_name});
-            try printDisassembly(export_symbol.address, export_symbol.text, flags_.bytes);
-        };
-        defer dbghelp.deinit();
-
-        const symbol_info = dbghelp.findSymbolInfo(image_path, symbol_name) catch |err| {
-            std.log.warn("Failed to find symbol info: {s}", .{@errorName(err)});
+        const symbol_info = findSymbol(&image, image_path, symbol_name) catch |err| {
+            std.log.warn("Error finding symbol info: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        } orelse {
+            std.log.err("Symbol not found", .{});
             std.process.exit(1);
         };
 
@@ -135,6 +131,22 @@ pub fn main() !void {
         const text = image.image_data[text_begin..text_end];
         try printDisassembly(address, text, flags_.bytes);
     }
+}
+
+fn findSymbol(image: *Image, image_path: []const u8, symbol_name: []const u8) !?dbghelp.SymbolLocation {
+    if (g_use_dbghelp) {
+        return try dbghelp.findSymbolInfo(image_path, symbol_name);
+    }
+
+    const export_symbol = image.findExportSymbol(symbol_name) catch |export_err| {
+        std.log.warn("Failed to find export symbol: {s}", .{@errorName(export_err)});
+        return export_err;
+    } orelse return null;
+
+    return .{
+        .image_rva = export_symbol.address,
+        .size = 0,
+    };
 }
 
 fn printDisassembly(base_address: u64, text: []const u8, print_bytes: bool) !void {

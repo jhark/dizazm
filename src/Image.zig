@@ -185,10 +185,9 @@ pub fn textRvaToFileRva(self: *const Self, rva: usize) usize {
 pub const ExportSymbol = struct {
     address: u64,
     ordinal: u16,
-    text: []const u8,
 };
 
-pub fn findExportSymbol(self: *const Self, symbol_name: []const u8, length: usize) !ExportSymbol {
+pub fn findExportSymbol(self: *const Self, symbol_name: []const u8) !?ExportSymbol {
     if (self.export_dir == null) {
         std.log.err("No export directory found in executable", .{});
         return error.NoExportDirectory;
@@ -219,21 +218,16 @@ pub fn findExportSymbol(self: *const Self, symbol_name: []const u8, length: usiz
 
     const symbol_index =
         std.sort.binarySearch(u32, function_names, compare_context, CompareContext.compare) orelse {
-            std.log.err("Symbol '{s}' not found in export table", .{symbol_name});
-            return error.SymbolNotFound;
+            return null;
         };
 
     const ordinal = function_ordinals[symbol_index];
     const symbol_address = function_addresses[ordinal];
-    const symbol_size = length;
-
-    const symbol_text = self.textRvaToFileRva(symbol_address);
 
     std.log.info("Found symbol {s} at address: 0x{x:08}, ordinal: {d}", .{ symbol_name, symbol_address, ordinal });
 
     return ExportSymbol{
         .address = symbol_address,
         .ordinal = ordinal,
-        .text = self.image_data[symbol_text .. symbol_text + symbol_size],
     };
 }
