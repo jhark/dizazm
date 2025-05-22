@@ -16,6 +16,7 @@ const TRUE = windows.TRUE;
 const SYMOPT_DEFERRED_LOADS = 0x00000004;
 const SYMOPT_DEBUG = 0x80000000;
 const SYMFLAG_FUNCTION = 0x00000800;
+const MAX_SYM_NAME = 2000;
 
 const SYMBOL_INFOW = extern struct {
     SizeOfStruct: u32,
@@ -33,6 +34,16 @@ const SYMBOL_INFOW = extern struct {
     NameLen: u32,
     MaxNameLen: u32,
     Name: [1]u16, // Note: This is a flexible length array.
+};
+
+const SYMBOL_INFOW_BUF = extern struct {
+    info: SYMBOL_INFOW,
+    name_buf: [MAX_SYM_NAME]u16,
+
+    fn name(self: *const @This()) []const u16 {
+        const p: [*]const u16 = @ptrCast(&self.info.Name);
+        return p[0..self.info.NameLen];
+    }
 };
 
 // The API just wants a unique identifier even though it takes a HANDLE.
@@ -68,6 +79,13 @@ var g_symFromNameW: *const fn (
     Symbol: *SYMBOL_INFOW,
 ) callconv(.winapi) BOOL = undefined;
 
+var g_symFromAddrW: *const fn (
+    hProcess: HANDLE,
+    Address: u64,
+    Displacement: ?*u64,
+    Symbol: *SYMBOL_INFOW,
+) callconv(.winapi) BOOL = undefined;
+
 fn loadProcAddress(ptr: anytype, name: [:0]const u8) !void {
     const p = GetProcAddress(g_dbghelp_dll, name) orelse return error.GetProcAddress;
     ptr.* = @ptrCast(@alignCast(p));
@@ -88,6 +106,7 @@ pub fn init() !void {
     try loadProcAddress(&g_symSetOptions, "SymSetOptions");
     try loadProcAddress(&g_symLoadModuleExW, "SymLoadModuleExW");
     try loadProcAddress(&g_symFromNameW, "SymFromNameW");
+    try loadProcAddress(&g_symFromAddrW, "SymFromAddrW");
 
     _ = g_symSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_DEBUG);
 
@@ -106,10 +125,7 @@ pub fn deinit() void {
     }
 }
 
-pub fn findSymbolInfo(
-    image_path: []const u8,
-    symbol_name: []const u8,
-) !?SymbolLocation {
+pub fn loadModule(image_path: []const u8) !u64 {
     var buf: [16384]u8 = undefined;
     var stack_allocator = std.heap.FixedBufferAllocator.init(&buf);
     const allocator = stack_allocator.allocator();
@@ -117,32 +133,33 @@ pub fn findSymbolInfo(
     const image_path_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, image_path);
     defer allocator.free(image_path_wtf16);
 
-    const symbol_name_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, symbol_name);
-    defer allocator.free(symbol_name_wtf16);
-
-    return findSymbolInfoW(image_path_wtf16, symbol_name_wtf16);
-}
-
-pub fn findSymbolInfoW(
-    image_path: [:0]const u16,
-    symbol_name: [:0]const u16,
-) !?SymbolLocation {
-    const mod_base = g_symLoadModuleExW(
-        g_handle,
-        null,
-        image_path.ptr,
-        null,
-        0,
-        0,
-        null,
-        0,
-    );
-
+    const mod_base = g_symLoadModuleExW(g_handle, null, image_path_wtf16.ptr, null, 0, 0, null, 0);
     if (mod_base == 0) {
         std.log.err("SymLoadModuleEx: {}\n", .{windows.GetLastError()});
         return error.SymLoadModuleExFailed;
     }
 
+    return mod_base;
+}
+
+pub fn findSymbolInfo(
+    mod_base: u64,
+    symbol_name: []const u8,
+) !?SymbolInfo {
+    var buf: [16384]u8 = undefined;
+    var stack_allocator = std.heap.FixedBufferAllocator.init(&buf);
+    const allocator = stack_allocator.allocator();
+
+    const symbol_name_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, symbol_name);
+    defer allocator.free(symbol_name_wtf16);
+
+    return findSymbolInfoW(mod_base, symbol_name_wtf16);
+}
+
+pub fn findSymbolInfoW(
+    mod_base: u64,
+    symbol_name: [:0]const u16,
+) !?SymbolInfo {
     var symbol_info: SYMBOL_INFOW = std.mem.zeroes(SYMBOL_INFOW);
     symbol_info.SizeOfStruct = @sizeOf(SYMBOL_INFOW);
 
@@ -161,15 +178,59 @@ pub fn findSymbolInfoW(
         symbol_info.ModBase = mod_base;
     }
 
-    return SymbolLocation{
+    return SymbolInfo{
         .image_rva = symbol_info.Address - symbol_info.ModBase,
         .size = symbol_info.Size,
     };
 }
 
-pub const SymbolLocation = struct {
-    image_rva: u64, // RVA in the image when mapped.
-    size: u64,
+pub fn findSymbolInfoFromAddress(
+    mod_base: u64,
+    address: u64,
+) !?SymbolInfo {
+    var symbol_info_buf: SYMBOL_INFOW_BUF = undefined;
+    symbol_info_buf.info = std.mem.zeroes(SYMBOL_INFOW);
+    symbol_info_buf.info.SizeOfStruct = @sizeOf(SYMBOL_INFOW);
+    symbol_info_buf.info.MaxNameLen = MAX_SYM_NAME;
+
+    var displacement: u64 = 0;
+
+    if (g_symFromAddrW(g_handle, mod_base + address, &displacement, &symbol_info_buf.info) == FALSE) {
+        const err = windows.GetLastError();
+        std.log.warn("SymFromAddrW: {}", .{err});
+        if (err == windows.Win32Error.MOD_NOT_FOUND) {
+            return null;
+        }
+        return error.SymFromAddrFailed;
+    }
+
+    // Sometimes the base address isn't set for some reason.
+    if (symbol_info_buf.info.ModBase == 0) {
+        symbol_info_buf.info.ModBase = mod_base;
+    }
+
+    var result = SymbolInfo{
+        .image_rva = symbol_info_buf.info.Address - symbol_info_buf.info.ModBase,
+        .size = symbol_info_buf.info.Size,
+        .displacement = displacement,
+    };
+
+    const name_len = try std.unicode.utf16LeToUtf8(&result.name_buf, symbol_info_buf.name());
+    result.name_len = @truncate(name_len);
+
+    return result;
+}
+
+pub const SymbolInfo = struct {
+    image_rva: u64 = 0, // RVA in the image when mapped.
+    size: u64 = 0,
+    displacement: u64 = 0, // Offset from start of symbol.
+    name_len: u16 = 0,
+    name_buf: [MAX_SYM_NAME]u8 = undefined,
+
+    pub fn name(self: *const @This()) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
 };
 
 pub fn main() !void {

@@ -52,6 +52,13 @@ file_header: *const pe.IMAGE_FILE_HEADER,
 optional_header: *const pe.IMAGE_OPTIONAL_HEADER64,
 export_dir: ?*const pe.IMAGE_EXPORT_DIRECTORY,
 text_section: *const pe.IMAGE_SECTION_HEADER,
+rdata_section: *const pe.IMAGE_SECTION_HEADER,
+idata_range: ?RvaRange, // Not a real section, contained within .rdata.
+
+const RvaRange = struct {
+    begin: u64,
+    end: u64,
+};
 
 const Self = @This();
 
@@ -130,14 +137,6 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
     const optional_header_begin: [*]const u8 = @ptrFromInt(@intFromPtr(file_header) + @sizeOf(pe.IMAGE_FILE_HEADER));
     const optional_header: *const pe.IMAGE_OPTIONAL_HEADER64 = @ptrCast(@alignCast(optional_header_begin));
 
-    const export_directory: ?*const pe.IMAGE_EXPORT_DIRECTORY = x: {
-        const export_dir_rva = optional_header.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        if (export_dir_rva == 0) {
-            break :x null;
-        }
-        break :x @ptrCast(@alignCast(image_data.ptr + export_dir_rva));
-    };
-
     const section_headers = x: {
         const begin: [*]const u8 = @ptrFromInt(@intFromPtr(optional_header) + file_header.SizeOfOptionalHeader);
         const headers: [*]const pe.IMAGE_SECTION_HEADER = @ptrCast(@alignCast(begin));
@@ -154,6 +153,81 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
         return error.TextSectionNotFound;
     };
 
+    const rdata_section: *const pe.IMAGE_SECTION_HEADER = x: {
+        for (section_headers, 0..) |section_header, i| {
+            if (std.mem.eql(u8, section_header.Name[0..6], ".rdata") and section_header.Name[6] == 0) {
+                break :x &section_headers[i];
+            }
+        }
+        std.log.err(".rdata section missing.", .{});
+        return error.RdataSectionNotFound;
+    };
+
+    const export_directory: ?*const pe.IMAGE_EXPORT_DIRECTORY = x: {
+        const export_dir_rva = optional_header.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        if (export_dir_rva == 0) {
+            break :x null;
+        }
+        const export_dir_file_rva = sectionRvaToFileRva(rdata_section, export_dir_rva);
+        break :x @ptrCast(@alignCast(image_data.ptr + export_dir_file_rva));
+    };
+
+    const imports_data_directory: *const pe.IMAGE_DATA_DIRECTORY = &optional_header.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT];
+    var import_descriptors = file_rva_slice(
+        pe.IMAGE_IMPORT_DESCRIPTOR,
+        image_data,
+        sectionRvaToFileRva(rdata_section, imports_data_directory.VirtualAddress),
+        imports_data_directory.Size / @sizeOf(pe.IMAGE_IMPORT_DESCRIPTOR),
+    );
+    // Last entry is a null terminator.
+    if (import_descriptors.len > 0) {
+        import_descriptors.len -= 1;
+    }
+
+    var thunk_lo: u64 = std.math.maxInt(u64);
+    var thunk_hi: u64 = 0;
+    for (import_descriptors) |import_descriptor| {
+        // if (import_descriptor.Name == 0) {
+        //     continue;
+        // }
+        // const dll_name: [*:0]const u8 = @ptrCast(file_rva(u8, image_data, sectionRvaToFileRva(rdata_section, import_descriptor.Name)));
+        // std.log.debug("dll_name: {s}", .{dll_name});
+        // comptime sentinel = ;
+        const thunks = file_rva(pe.IMAGE_THUNK_DATA64, image_data, sectionRvaToFileRva(rdata_section, import_descriptor.FirstThunk));
+        thunk_lo = @min(thunk_lo, sectionRvaToFileRva(rdata_section, import_descriptor.FirstThunk));
+
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            const thunk = thunks[i];
+            if (thunk.u.Ordinal == 0) {
+                break;
+            }
+
+            // const thunk_rva = sectionRvaToFileRva(rdata_section, import_descriptor.FirstThunk) + i * @sizeOf(pe.IMAGE_THUNK_DATA64);
+            // if (thunk.isOrdinal()) {
+            //     const ordinal = thunk.asOrdinal();
+            //     std.log.debug("0x{x:016}: ordinal: {d}", .{ thunk_rva, ordinal });
+            // } else {
+            //     const name_import = file_rva(pe.IMAGE_IMPORT_BY_NAME, image_data, sectionRvaToFileRva(rdata_section, thunk.u.AddressOfData));
+            //     std.log.debug("0x{x:016}: name_import: {s}", .{ thunk_rva, name_import[0].name() });
+            // }
+        }
+
+        {
+            const thunk_rva = sectionRvaToFileRva(rdata_section, import_descriptor.FirstThunk) + i * @sizeOf(pe.IMAGE_THUNK_DATA64);
+            thunk_hi = @max(thunk_hi, thunk_rva);
+        }
+    }
+
+    const idata_range =
+        if (import_descriptors.len > 0)
+            RvaRange{
+                .begin = thunk_lo,
+                .end = thunk_hi,
+            }
+        else
+            null;
+
     return Self{
         .image_data = image_data,
         .dos_header = dos_header,
@@ -161,6 +235,8 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
         .optional_header = optional_header,
         .export_dir = export_directory,
         .text_section = text_section,
+        .rdata_section = rdata_section,
+        .idata_range = idata_range,
     };
 }
 
@@ -173,13 +249,99 @@ pub fn deinit(self: *Self) void {
 
 // Converts from an RVA inside a properly mapped .text section to a file offset.
 pub fn textRvaToFileRva(self: *const Self, rva: usize) usize {
+    return sectionRvaToFileRva(self.text_section, rva);
+}
+
+pub fn rdataRvaToFileRva(self: *const Self, rva: usize) usize {
+    return sectionRvaToFileRva(self.rdata_section, rva);
+}
+
+fn sectionRvaToFileRva(section: *const pe.IMAGE_SECTION_HEADER, rva: usize) usize {
     // The address is relative to the base of the image, after the image has
     // been mapped according to the virtual addresses for each section.
     //
     // Therefore to find the location in the file, we subtract the virtual
     // address of the section to get the section offset, and add the offset
     // ofthe section within the file.
-    return rva - self.text_section.VirtualAddress + self.text_section.PointerToRawData;
+    return rva - section.VirtualAddress + section.PointerToRawData;
+}
+
+pub const ImportInfo = struct {
+    import: union(enum) {
+        name: [*:0]const u8,
+        ordinal: u16,
+    },
+    dll_name: [*:0]const u8,
+};
+
+pub fn getImportInfo(self: *const Self, rva: usize) ?ImportInfo {
+    if (self.idata_range == null) {
+        return null;
+    }
+
+    const import_desc: *const pe.IMAGE_IMPORT_DESCRIPTOR = x: {
+        const imports_data_directory: *const pe.IMAGE_DATA_DIRECTORY = &self.optional_header.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT];
+        var import_descriptors = file_rva_slice(
+            pe.IMAGE_IMPORT_DESCRIPTOR,
+            self.image_data,
+            sectionRvaToFileRva(self.rdata_section, imports_data_directory.VirtualAddress),
+            imports_data_directory.Size / @sizeOf(pe.IMAGE_IMPORT_DESCRIPTOR),
+        );
+        // Last entry is a null terminator.
+        if (import_descriptors.len > 0) {
+            import_descriptors.len -= 1;
+        }
+
+        if (import_descriptors.len == 0) {
+            return null;
+        }
+
+        var best_desc: *const pe.IMAGE_IMPORT_DESCRIPTOR = undefined;
+        var best_offset: usize = std.math.maxInt(usize);
+        for (import_descriptors) |*import_descriptor| {
+            const offset = rva - import_descriptor.FirstThunk;
+            if (offset < best_offset) {
+                best_desc = import_descriptor;
+                best_offset = offset;
+            }
+        }
+        break :x best_desc;
+    };
+
+    const dll_name: [*:0]const u8 = @ptrCast(file_rva(
+        u8,
+        self.image_data,
+        sectionRvaToFileRva(
+            self.rdata_section,
+            import_desc.Name,
+        ),
+    ));
+
+    const thunk = file_rva(pe.IMAGE_THUNK_DATA64, self.image_data, sectionRvaToFileRva(self.rdata_section, rva))[0];
+    if (thunk.isOrdinal()) {
+        return ImportInfo{
+            .import = .{ .ordinal = thunk.asOrdinal() },
+            .dll_name = dll_name,
+        };
+    }
+
+    const name_import = file_rva(pe.IMAGE_IMPORT_BY_NAME, self.image_data, sectionRvaToFileRva(self.rdata_section, thunk.u.AddressOfData));
+    return ImportInfo{
+        .import = .{ .name = name_import[0].name() },
+        .dll_name = dll_name,
+    };
+}
+
+pub fn inIdataSection(self: *const Self, rva: usize) bool {
+    if (self.idata_range == null) {
+        return false;
+    } else {
+        return rva >= self.idata_range.?.begin and rva < self.idata_range.?.end;
+    }
+}
+
+pub fn inTextSection(self: *const Self, rva: usize) bool {
+    return rva >= self.text_section.VirtualAddress and rva < self.text_section.VirtualAddress + self.text_section.SizeOfRawData;
 }
 
 pub const ExportSymbol = struct {

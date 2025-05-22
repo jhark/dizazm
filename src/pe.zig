@@ -1,3 +1,10 @@
+// Windows Portable Executable File Format.
+//
+// References:
+//
+//   * winnt.h
+//   * https://learn.microsoft.com/en-us/archive/msdn-magazine/2002/march/inside-windows-an-in-depth-look-into-the-win32-portable-executable-file-format-part-2
+
 pub const IMAGE_DOS_HEADER = extern struct {
     e_magic: u16,
     e_cblp: u16,
@@ -82,6 +89,7 @@ pub const IMAGE_DATA_DIRECTORY = extern struct {
 };
 
 pub const IMAGE_DIRECTORY_ENTRY_EXPORT = 0;
+pub const IMAGE_DIRECTORY_ENTRY_IMPORT = 1;
 
 pub const IMAGE_EXPORT_DIRECTORY = extern struct {
     Characteristics: u32,
@@ -95,6 +103,67 @@ pub const IMAGE_EXPORT_DIRECTORY = extern struct {
     AddressOfFunctions: u32,
     AddressOfNames: u32,
     AddressOfNameOrdinals: u32,
+};
+
+pub const IMAGE_IMPORT_DESCRIPTOR = extern struct {
+    u: extern union {
+        Characteristics: u32, // 0 for terminating null import descriptor
+        OriginalFirstThunk: u32, // RVA to original unbound IAT (PIMAGE_THUNK_DATA)
+    },
+
+    // 0 if not bound,
+    // -1 if bound, and real date\time stamp
+    //     in IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT (new BIND)
+    // O.W. date/time stamp of DLL bound to (Old BIND)
+    TimeDateStamp: u32,
+
+    // -1 if no forwarders
+    ForwarderChain: u32,
+
+    Name: u32, // RVA to name of dll.
+
+    // RVA to IAT (if bound this IAT has actual addresses)
+    FirstThunk: u32, // Array of IMAGE_THUNK_DATA64
+};
+
+pub const IMAGE_THUNK_DATA64 = extern struct {
+    u: extern union {
+        // PBYTE
+        ForwarderString: u64,
+
+        // Active after binding. Address of function.
+        Function: u64,
+
+        // Active before binding if the ordinal flag is set.
+        Ordinal: u64,
+
+        // Active before binding if the ordinal flag is not set.
+        // RVA to IMAGE_IMPORT_BY_NAME.
+        AddressOfData: u64,
+    },
+
+    pub inline fn isOrdinal(self: IMAGE_THUNK_DATA64) bool {
+        return (self.u.Ordinal & IMAGE_ORDINAL_FLAG64) != 0;
+    }
+
+    pub inline fn asOrdinal(self: IMAGE_THUNK_DATA64) u16 {
+        if (!self.isOrdinal()) {
+            @panic("Not an ordinal");
+        }
+        return @truncate(self.u.Ordinal);
+    }
+};
+
+pub const IMAGE_ORDINAL_FLAG64 = 0x8000000000000000;
+pub const IMAGE_ORDINAL_FLAG32 = 0x80000000;
+
+pub const IMAGE_IMPORT_BY_NAME = extern struct {
+    Hint: u16, // Possible ordinal.
+    Name: [1]u8, // Null-terminated name.
+
+    pub inline fn name(self: *const IMAGE_IMPORT_BY_NAME) [*:0]const u8 {
+        return @ptrCast(&self.Name);
+    }
 };
 
 pub const IMAGE_DOS_SIGNATURE = 0x5A4D; // MZ
