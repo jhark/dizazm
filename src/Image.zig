@@ -278,6 +278,9 @@ pub fn getImportInfo(self: *const Self, rva: usize) ?ImportInfo {
     if (self.idata_range == null) {
         return null;
     }
+    if (rva == 0) {
+        return null;
+    }
 
     const import_desc: *const pe.IMAGE_IMPORT_DESCRIPTOR = x: {
         const imports_data_directory: *const pe.IMAGE_DATA_DIRECTORY = &self.optional_header.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -299,6 +302,10 @@ pub fn getImportInfo(self: *const Self, rva: usize) ?ImportInfo {
         var best_desc: *const pe.IMAGE_IMPORT_DESCRIPTOR = undefined;
         var best_offset: usize = std.math.maxInt(usize);
         for (import_descriptors) |*import_descriptor| {
+            if (rva < import_descriptor.FirstThunk) {
+                continue;
+            }
+
             const offset = rva - import_descriptor.FirstThunk;
             if (offset < best_offset) {
                 best_desc = import_descriptor;
