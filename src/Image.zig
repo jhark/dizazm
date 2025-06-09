@@ -46,6 +46,7 @@ fn file_rva_slice(comptime T: type, data: []const u8, rva_: anytype, len_: anyty
     return t[0..len_u];
 }
 
+mapping: Mapping,
 image_data: []const u8,
 dos_header: *const pe.IMAGE_DOS_HEADER,
 file_header: *const pe.IMAGE_FILE_HEADER,
@@ -62,57 +63,129 @@ const RvaRange = struct {
 
 const Self = @This();
 
+const builtin = @import("builtin");
+
+const Mapping = switch (builtin.os.tag) {
+    .windows => struct {
+        data: []const u8,
+        handle: windows.HANDLE,
+
+        fn init(allocator: std.mem.Allocator, path: []const u8) !Mapping {
+            const path_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, path);
+            defer allocator.free(path_wtf16);
+
+            const file = CreateFileW(
+                path_wtf16.ptr,
+                windows.GENERIC_READ,
+                windows.FILE_SHARE_READ,
+                null,
+                windows.OPEN_EXISTING,
+                windows.FILE_ATTRIBUTE_NORMAL,
+                null,
+            );
+            if (file == windows.INVALID_HANDLE_VALUE) {
+                std.log.err("CreateFileW: {}", .{windows.GetLastError()});
+                return error.CreateFileFailed;
+            }
+            defer windows.CloseHandle(file);
+
+            const file_mapping = CreateFileMappingW(
+                file,
+                null,
+                windows.PAGE_READONLY,
+                0,
+                0,
+                null,
+            );
+            if (file_mapping == null) {
+                std.log.err("CreateFileMappingW: {}", .{windows.GetLastError()});
+                return error.CreateFileMappingFailed;
+            }
+            defer windows.CloseHandle(file_mapping.?);
+
+            const file_base = MapViewOfFile(
+                file_mapping.?,
+                FILE_MAP_READ,
+                0,
+                0,
+                0,
+            );
+            if (file_base == null) {
+                std.log.err("MapViewOfFile: {}", .{windows.GetLastError()});
+                return error.MapViewOfFileFailed;
+            }
+
+            const image_data = x: {
+                var mbi: windows.MEMORY_BASIC_INFORMATION = undefined;
+                _ = try windows.VirtualQuery(file_base, &mbi, @sizeOf(windows.MEMORY_BASIC_INFORMATION));
+                const file_bytes_begin: [*]const u8 = @ptrCast(file_base);
+                break :x file_bytes_begin[0..mbi.RegionSize];
+            };
+
+            return Mapping{
+                .data = image_data,
+                .handle = file_mapping,
+            };
+        }
+
+        fn deinit(self: *Mapping) void {
+            const ok = UnmapViewOfFile(self.data.ptr);
+            if (ok == windows.FALSE) {
+                std.log.err("UnmapViewOfFile: {}", .{windows.GetLastError()});
+            }
+            std.log.debug("UnmapViewOfFile: {}", .{ok});
+
+            _ = windows.CloseHandle(self.handle);
+        }
+    },
+
+    // .macos, .linux => struct {
+    //     data: []const u8,
+
+    //     fn init(allocator: std.mem.Allocator, path: []const u8) !Mapping {
+    //         _ = allocator;
+
+    //         const file = std.fs.cwd().openFile(path, .{}) catch return error.FileNotFound;
+    //         defer file.close();
+
+    //         const data = try std.posix.mmap(
+    //             null,
+    //             std.math.maxInt(usize),
+    //             std.posix.PROT.READ,
+    //             .{ .TYPE = .PRIVATE },
+    //             file.handle,
+    //             0,
+    //         );
+
+    //         return Mapping{ .data = data };
+    //     }
+
+    //     fn deinit(self: *Mapping) void {
+    //         _ = std.posix.munmap(@alignCast(self.data));
+    //     }
+    // },
+
+    else => struct {
+        allocator: std.mem.Allocator,
+        data: []const u8,
+
+        fn init(allocator: std.mem.Allocator, path: []const u8) !Mapping {
+            const file = std.fs.cwd().openFile(path, .{}) catch return error.FileNotFound;
+            defer file.close();
+
+            const data = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+            return Mapping{ .allocator = allocator, .data = data };
+        }
+
+        fn deinit(self: *Mapping) void {
+            self.allocator.free(self.data);
+        }
+    },
+};
+
 pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
-    const path_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, path);
-    defer allocator.free(path_wtf16);
-
-    const file = CreateFileW(
-        path_wtf16.ptr,
-        windows.GENERIC_READ,
-        windows.FILE_SHARE_READ,
-        null,
-        windows.OPEN_EXISTING,
-        windows.FILE_ATTRIBUTE_NORMAL,
-        null,
-    );
-    if (file == windows.INVALID_HANDLE_VALUE) {
-        std.log.err("CreateFileW: {}", .{windows.GetLastError()});
-        return error.CreateFileFailed;
-    }
-    defer windows.CloseHandle(file);
-
-    const file_mapping = CreateFileMappingW(
-        file,
-        null,
-        windows.PAGE_READONLY,
-        0,
-        0,
-        null,
-    );
-    if (file_mapping == null) {
-        std.log.err("CreateFileMappingW: {}", .{windows.GetLastError()});
-        return error.CreateFileMappingFailed;
-    }
-    defer windows.CloseHandle(file_mapping.?);
-
-    const file_base = MapViewOfFile(
-        file_mapping.?,
-        FILE_MAP_READ,
-        0,
-        0,
-        0,
-    );
-    if (file_base == null) {
-        std.log.err("MapViewOfFile: {}", .{windows.GetLastError()});
-        return error.MapViewOfFileFailed;
-    }
-
-    const image_data = x: {
-        var mbi: windows.MEMORY_BASIC_INFORMATION = undefined;
-        _ = try windows.VirtualQuery(file_base, &mbi, @sizeOf(windows.MEMORY_BASIC_INFORMATION));
-        const file_bytes_begin: [*]const u8 = @ptrCast(file_base);
-        break :x file_bytes_begin[0..mbi.RegionSize];
-    };
+    const mapping = try Mapping.init(allocator, path);
+    const image_data = mapping.data;
 
     const dos_header: *const pe.IMAGE_DOS_HEADER = @ptrCast(@alignCast(image_data.ptr));
     if (dos_header.e_magic != pe.IMAGE_DOS_SIGNATURE) {
@@ -229,6 +302,7 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
             null;
 
     return Self{
+        .mapping = mapping,
         .image_data = image_data,
         .dos_header = dos_header,
         .file_header = file_header,
@@ -241,10 +315,7 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
 }
 
 pub fn deinit(self: *Self) void {
-    const ok = UnmapViewOfFile(self.image_data.ptr);
-    if (ok == windows.FALSE) {
-        std.log.err("UnmapViewOfFile: {}", .{windows.GetLastError()});
-    }
+    self.mapping.deinit();
 }
 
 // Converts from an RVA inside a properly mapped .text section to a file offset.

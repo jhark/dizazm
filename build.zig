@@ -14,7 +14,9 @@ pub fn build(b: *std.Build) void {
         .name = "dizazm",
         .root_module = exe_mod,
     });
-    exe.linkSystemLibrary("kernel32");
+    if (target.result.os.tag == .windows) {
+        exe.linkSystemLibrary("kernel32");
+    }
 
     const flags_dep = b.dependency("flags", .{
         .target = target,

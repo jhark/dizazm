@@ -1,7 +1,8 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const flags = @import("flags");
 const cs = @import("capstone.zig");
-const dbghelp = @import("dbghelp.zig");
+const dbghelp = if (builtin.os.tag == .windows) @import("dbghelp.zig") else @import("dbghelp_stub.zig");
 const nt = @import("nt.zig");
 const Image = @import("Image.zig");
 const Enum = @import("Enum.zig").Enum;
@@ -42,7 +43,9 @@ const Flags = struct {
 };
 
 pub fn main() !void {
-    _ = std.os.windows.kernel32.SetConsoleOutputCP(65001); // UTF-8
+    if (builtin.os.tag == .windows) {
+        _ = std.os.windows.kernel32.SetConsoleOutputCP(65001); // UTF-8
+    }
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
