@@ -126,7 +126,7 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
     }
 
     const file_header: *const pe.IMAGE_FILE_HEADER = @ptrCast(@alignCast(nt_headers_begin + pe_magic.len));
-    if (file_header.Machine != pe.IMAGE_FILE_MACHINE_AMD64) {
+    if (file_header.Machine != .amd64) {
         std.log.err("Unsupported machine type: {}", .{file_header.Machine});
         return error.UnsupportedMachineType;
     }
