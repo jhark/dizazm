@@ -90,6 +90,7 @@ pub const IMAGE_DATA_DIRECTORY = extern struct {
 
 pub const IMAGE_DIRECTORY_ENTRY_EXPORT = 0;
 pub const IMAGE_DIRECTORY_ENTRY_IMPORT = 1;
+pub const IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13;
 
 pub const IMAGE_EXPORT_DIRECTORY = extern struct {
     Characteristics: u32,
@@ -124,6 +125,20 @@ pub const IMAGE_IMPORT_DESCRIPTOR = extern struct {
 
     // RVA to IAT (if bound this IAT has actual addresses)
     FirstThunk: u32, // Array of IMAGE_THUNK_DATA64
+};
+
+pub const IMAGE_DELAYLOAD_DESCRIPTOR = extern struct {
+    Attributes: packed struct(u32) {
+        RvaBased: bool,
+        ReservedAttributes: u31,
+    },
+    DllNameRVA: u32, // RVA to name of the dll
+    ModuleHandleRVA: u32, // RVA to module handle (in .data section)
+    ImportAddressTableRVA: u32, // RVA to optional IAT
+    ImportNameTableRVA: u32, // RVA to optional import name table
+    BoundImportAddressTableRVA: u32, // RVA to optional bound IAT
+    UnloadInformationTableRVA: u32, // RVA to optional unload info table
+    TimeDateStamp: u32, // 0 if not bound, otherwise date/time stamp
 };
 
 pub const IMAGE_THUNK_DATA64 = extern struct {

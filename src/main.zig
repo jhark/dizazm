@@ -352,6 +352,21 @@ fn printDisassembly(image: *Image, sym_mod_base: u64, base_address: u64, text: [
                     }
                 }
 
+                // Delay-loaded imports.
+                if (image.inDelayIdataSection(target)) {
+                    const mb_delay_import_info: ?Image.ImportInfo = image.getDelayImportInfo(target);
+                    if (mb_delay_import_info) |import_info| {
+                        switch (import_info.import) {
+                            .name => |name| {
+                                comment = std.fmt.bufPrint(&comment_buf, "{s}!{s} [delay-load]", .{ import_info.dll_name, name }) catch "";
+                            },
+                            .ordinal => |ordinal| {
+                                comment = std.fmt.bufPrint(&comment_buf, "{s}!<ordinal:{d}> [delay-load]", .{ import_info.dll_name, ordinal }) catch "";
+                            },
+                        }
+                    }
+                }
+
                 break :write_comment;
             }
 

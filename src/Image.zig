@@ -54,6 +54,7 @@ export_dir: ?*const pe.IMAGE_EXPORT_DIRECTORY,
 text_section: *const pe.IMAGE_SECTION_HEADER,
 rdata_section: *const pe.IMAGE_SECTION_HEADER,
 idata_range: ?RvaRange, // Not a real section, contained within .rdata.
+delay_idata_range: ?RvaRange, // Delay-load import address table range
 
 const RvaRange = struct {
     begin: u64,
@@ -228,6 +229,70 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
         else
             null;
 
+    const delay_idata_range = x: {
+        const delay_imports_data_directory: *const pe.IMAGE_DATA_DIRECTORY = &optional_header.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+        if (delay_imports_data_directory.VirtualAddress == 0 or delay_imports_data_directory.Size == 0) {
+            break :x null;
+        }
+
+        var delayload_descriptors = file_rva_slice(
+            pe.IMAGE_DELAYLOAD_DESCRIPTOR,
+            image_data,
+            sectionRvaToFileRva(rdata_section, delay_imports_data_directory.VirtualAddress),
+            delay_imports_data_directory.Size / @sizeOf(pe.IMAGE_DELAYLOAD_DESCRIPTOR),
+        );
+
+        // Last entry is a null terminator.
+        if (delayload_descriptors.len > 0) {
+            delayload_descriptors.len -= 1;
+        }
+
+        if (delayload_descriptors.len == 0) {
+            break :x null;
+        }
+
+        var delay_thunk_lo: u64 = std.math.maxInt(u64);
+        var delay_thunk_hi: u64 = 0;
+
+        for (delayload_descriptors) |delay_desc| {
+            if (delay_desc.ImportAddressTableRVA == 0) {
+                continue;
+            }
+
+            if (!delay_desc.Attributes.RvaBased) {
+                std.log.warn("Legacy delay-load import format not supported.", .{});
+                continue;
+            }
+
+            const delay_thunks_rva = delay_desc.ImportAddressTableRVA;
+            const delay_thunks_file_rva = sectionRvaToFileRva(
+                rdata_section,
+                delay_thunks_rva,
+            );
+            delay_thunk_lo = @min(delay_thunk_lo, delay_thunks_file_rva);
+
+            const thunks = file_rva(
+                pe.IMAGE_THUNK_DATA64,
+                image_data,
+                delay_thunks_file_rva,
+            );
+            var i: usize = 0;
+            while (thunks[i].u.Ordinal != 0) : (i += 1) {}
+
+            const delay_thunk_end = delay_thunks_file_rva + i * @sizeOf(pe.IMAGE_THUNK_DATA64);
+            delay_thunk_hi = @max(delay_thunk_hi, delay_thunk_end);
+        }
+
+        if (delay_thunk_lo == std.math.maxInt(u64)) {
+            break :x null;
+        }
+
+        break :x RvaRange{
+            .begin = delay_thunk_lo,
+            .end = delay_thunk_hi,
+        };
+    };
+
     return Self{
         .image_data = image_data,
         .dos_header = dos_header,
@@ -237,6 +302,7 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8) !Self {
         .text_section = text_section,
         .rdata_section = rdata_section,
         .idata_range = idata_range,
+        .delay_idata_range = delay_idata_range,
     };
 }
 
@@ -302,9 +368,7 @@ pub fn getImportInfo(self: *const Self, rva: usize) ?ImportInfo {
         var best_desc: *const pe.IMAGE_IMPORT_DESCRIPTOR = undefined;
         var best_offset: usize = std.math.maxInt(usize);
         for (import_descriptors) |*import_descriptor| {
-            if (rva < import_descriptor.FirstThunk) {
-                continue;
-            }
+            if (rva < import_descriptor.FirstThunk) continue;
 
             const offset = rva - import_descriptor.FirstThunk;
             if (offset < best_offset) {
@@ -349,6 +413,129 @@ pub fn inIdataSection(self: *const Self, rva: usize) bool {
 
 pub fn inTextSection(self: *const Self, rva: usize) bool {
     return rva >= self.text_section.VirtualAddress and rva < self.text_section.VirtualAddress + self.text_section.SizeOfRawData;
+}
+
+pub fn inDelayIdataSection(self: *const Self, rva: usize) bool {
+    const range = self.delay_idata_range orelse return false;
+    return rva >= range.begin and rva < range.end;
+}
+
+pub fn getDelayImportInfo(self: *const Self, rva: usize) ?ImportInfo {
+    if (self.delay_idata_range == null) {
+        return null;
+    }
+
+    const delay_imports_data_directory: *const pe.IMAGE_DATA_DIRECTORY =
+        &self.optional_header.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (delay_imports_data_directory.VirtualAddress == 0 or delay_imports_data_directory.Size == 0) {
+        return null;
+    }
+
+    var delayload_descriptors = file_rva_slice(
+        pe.IMAGE_DELAYLOAD_DESCRIPTOR,
+        self.image_data,
+        sectionRvaToFileRva(self.rdata_section, delay_imports_data_directory.VirtualAddress),
+        delay_imports_data_directory.Size / @sizeOf(pe.IMAGE_DELAYLOAD_DESCRIPTOR),
+    );
+
+    // Last entry is a null terminator.
+    if (delayload_descriptors.len > 0) {
+        delayload_descriptors.len -= 1;
+    }
+
+    if (delayload_descriptors.len == 0) {
+        return null;
+    }
+
+    // Find the delay import descriptor that contains this RVA
+    const delay_import_desc: *const pe.IMAGE_DELAYLOAD_DESCRIPTOR = x: {
+        var best_desc: *const pe.IMAGE_DELAYLOAD_DESCRIPTOR = undefined;
+        var best_offset: usize = std.math.maxInt(usize);
+
+        for (delayload_descriptors) |*desc| {
+            if (desc.ImportAddressTableRVA == 0) {
+                continue;
+            }
+
+            if (!desc.Attributes.RvaBased) {
+                continue;
+            }
+
+            const iat_start = desc.ImportAddressTableRVA;
+            if (rva < iat_start) {
+                continue;
+            }
+
+            const offset = rva - iat_start;
+            if (offset < best_offset) {
+                best_desc = desc;
+                best_offset = offset;
+            }
+        }
+
+        if (best_offset == std.math.maxInt(usize)) {
+            return null;
+        }
+
+        break :x best_desc;
+    };
+
+    const dll_name: [*:0]const u8 = @ptrCast(file_rva(
+        u8,
+        self.image_data,
+        sectionRvaToFileRva(self.rdata_section, delay_import_desc.DllNameRVA),
+    ));
+
+    const thunk = file_rva(
+        pe.IMAGE_THUNK_DATA64,
+        self.image_data,
+        sectionRvaToFileRva(self.rdata_section, rva),
+    )[0];
+
+    if (delay_import_desc.ImportNameTableRVA != 0) {
+        const thunk_index = (rva - delay_import_desc.ImportAddressTableRVA) / @sizeOf(pe.IMAGE_THUNK_DATA64);
+
+        const int_thunks = file_rva(
+            pe.IMAGE_THUNK_DATA64,
+            self.image_data,
+            sectionRvaToFileRva(self.rdata_section, delay_import_desc.ImportNameTableRVA),
+        );
+        const int_thunk = int_thunks[thunk_index];
+
+        if (int_thunk.isOrdinal()) {
+            return ImportInfo{
+                .import = .{ .ordinal = int_thunk.asOrdinal() },
+                .dll_name = dll_name,
+            };
+        }
+
+        const name_import = file_rva(
+            pe.IMAGE_IMPORT_BY_NAME,
+            self.image_data,
+            sectionRvaToFileRva(self.rdata_section, int_thunk.u.AddressOfData),
+        );
+        return ImportInfo{
+            .import = .{ .name = name_import[0].name() },
+            .dll_name = dll_name,
+        };
+    }
+
+    if (thunk.isOrdinal()) {
+        return ImportInfo{
+            .import = .{ .ordinal = thunk.asOrdinal() },
+            .dll_name = dll_name,
+        };
+    }
+
+    const name_import = file_rva(
+        pe.IMAGE_IMPORT_BY_NAME,
+        self.image_data,
+        sectionRvaToFileRva(self.rdata_section, thunk.u.AddressOfData),
+    );
+    return ImportInfo{
+        .import = .{ .name = name_import[0].name() },
+        .dll_name = dll_name,
+    };
 }
 
 pub const ExportSymbol = struct {
